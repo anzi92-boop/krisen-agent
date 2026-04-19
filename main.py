@@ -1,22 +1,22 @@
-import feedparser
+import os
+import time
+import requests
 
-KEYWORDS = [
-    "war", "conflict", "iran", "israel",
-    "oil", "nato", "attack",
-    "protest", "lockdown", "emergency"
-]
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": msg}
+    requests.post(url, data=data, timeout=10)
 
 def run_cycle():
-    print("News Check läuft...")
-
-    feed = feedparser.parse("https://news.google.com/rss")
-
-    for entry in feed.entries[:10]:
-        title = entry.title.lower()
-
-        for keyword in KEYWORDS:
-            if keyword in title:
-                send_telegram(f"🚨 KRISEN ALERT:\n{entry.title}")
-                break
-
+    print("Test läuft...")
+    send_telegram("🚨 TEST ALERT – System funktioniert!")
     time.sleep(300)
+
+if __name__ == "__main__":
+    send_telegram("✅ Test gestartet")
+
+    while True:
+        run_cycle()
