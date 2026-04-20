@@ -4,7 +4,7 @@ import json
 import hashlib
 import requests
 import feedparser
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -18,6 +18,9 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=flight+ban+OR+travel+warning+OR+closed+airspace+OR+state+of+emergency+OR+missile+attack+OR+embassy+evacuation&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=brent+oil+OR+wti+oil+OR+crude+oil+price+OR+strait+of+hormuz&hl=en-US&gl=US&ceid=US:en",
 ]
+
+USGS_SIGNIFICANT_EARTHQUAKES_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_hour.geojson"
+USGS_ALL_M45_EARTHQUAKES_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_hour.geojson"
 
 WATCH_REGIONS = [
     "iran", "israel", "gaza", "lebanon", "syria", "iraq",
@@ -55,6 +58,9 @@ CATEGORIES = {
     "REISEWARNUNG": [
         "travel warning", "travel advisory", "do not travel",
         "avoid all travel", "security alert", "tourist warning"
+    ],
+    "ERDBEBEN": [
+        "earthquake", "quake", "seismic", "aftershock"
     ]
 }
 
@@ -189,7 +195,7 @@ def classify_risk(title: str, summary: str, category: str) -> str:
             return "HIGH"
         return "MEDIUM"
 
-    if category in ["KRIEG", "PROTESTE"]:
+    if category in ["KRIEG", "PROTESTE", "ERDBEBEN"]:
         return "MEDIUM"
 
     return "LOW"
@@ -206,7 +212,10 @@ def should_alert(category: str, risk: str, title: str, summary: str) -> bool:
             "brent", "wti", "oil", "crude", "hormuz", "supply disruption", "shipping disruption"
         ])
 
-    if not is_relevant_region(title, summary) and category != "ÖL":
+    if category == "ERDBEBEN":
+        return True
+
+    if not is_relevant_region(title, summary):
         return False
 
     return risk in ["HIGH", "MEDIUM"]
@@ -216,13 +225,13 @@ def is_duplicate_title(normalized_title: str, recent_titles: list) -> bool:
     return normalized_title in recent_titles
 
 
-def remember_title(state, normalized_title: str, max_titles: int = 400):
+def remember_title(state, normalized_title: str, max_titles: int = 500):
     state["recent_titles"].append(normalized_title)
     if len(state["recent_titles"]) > max_titles:
         state["recent_titles"] = state["recent_titles"][-max_titles:]
 
 
-def remember_seen_id(state, alert_id: str, max_ids: int = 2000):
+def remember_seen_id(state, alert_id: str, max_ids: int = 3000):
     state["seen_ids"].append(alert_id)
     if len(state["seen_ids"]) > max_ids:
         state["seen_ids"] = state["seen_ids"][-max_ids:]
@@ -239,6 +248,20 @@ def format_message(category: str, risk: str, title: str, link: str, source: str)
     return (
         f"{icon} {category}-ALERT [{risk}]\n\n"
         f"{title}\n\n"
+        f"Quelle: {source}\n"
+        f"{link}"
+    )
+
+
+def format_earthquake_message(magnitude: float, place: str, link: str, source: str, ts_ms: int) -> str:
+    risk = "HIGH" if magnitude >= 6.0 else "MEDIUM"
+    icon = "🔴" if risk == "HIGH" else "🟠"
+    dt = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"{icon} ERDBEBEN-ALERT [{risk}]\n\n"
+        f"Magnitude: {magnitude}\n"
+        f"Ort: {place}\n"
+        f"Zeit: {dt}\n\n"
         f"Quelle: {source}\n"
         f"{link}"
     )
@@ -264,9 +287,8 @@ def high_alert_on_cooldown(state, cooldown_key: str) -> bool:
 
 def mark_high_alert_sent(state, cooldown_key: str):
     state["high_alert_history"][cooldown_key] = now_iso()
-
-    if len(state["high_alert_history"]) > 1000:
-        items = list(state["high_alert_history"].items())[-1000:]
+    if len(state["high_alert_history"]) > 1200:
+        items = list(state["high_alert_history"].items())[-1200:]
         state["high_alert_history"] = dict(items)
 
 
@@ -279,8 +301,8 @@ def queue_medium_alert(state, category: str, title: str, link: str, source: str)
     }
     state["medium_digest_queue"].append(item)
 
-    if len(state["medium_digest_queue"]) > 80:
-        state["medium_digest_queue"] = state["medium_digest_queue"][-80:]
+    if len(state["medium_digest_queue"]) > 100:
+        state["medium_digest_queue"] = state["medium_digest_queue"][-100:]
 
 
 def maybe_send_medium_digest(state):
@@ -329,7 +351,7 @@ def maybe_send_daily_summary(state):
         state["daily_counts"] = {}
 
 
-def process_entry(state, entry):
+def process_rss_entry(state, entry):
     title = getattr(entry, "title", "").strip()
     summary = getattr(entry, "summary", "").strip()
     link = getattr(entry, "link", "").strip()
@@ -372,39 +394,99 @@ def process_entry(state, entry):
     return True
 
 
-def check_feeds():
+def process_usgs_feed(state, url):
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print("USGS Fehler:", e)
+        return 0
+
+    alerts = 0
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        quake_id = feature.get("id", "")
+        mag = props.get("mag")
+        place = props.get("place", "Unbekannt")
+        link = props.get("url", "")
+        ts_ms = props.get("time", 0)
+
+        if quake_id is None or mag is None:
+            continue
+
+        alert_id = f"usgs:{quake_id}"
+        if alert_id in state["seen_ids"]:
+            continue
+
+        remember_seen_id(state, alert_id)
+        increment_daily_count(state, "ERDBEBEN")
+
+        risk = "HIGH" if float(mag) >= 6.0 else "MEDIUM"
+        source = "USGS"
+
+        if risk == "HIGH":
+            cooldown_key = f"ERDBEBEN:{quake_id}"
+            if not high_alert_on_cooldown(state, cooldown_key):
+                msg = format_earthquake_message(float(mag), place, link, source, ts_ms)
+                if send_telegram(msg):
+                    mark_high_alert_sent(state, cooldown_key)
+        else:
+            title = f"M {mag} earthquake - {place}"
+            queue_medium_alert(state, "ERDBEBEN", title, link, source)
+
+        alerts += 1
+
+    return alerts
+
+
+def check_rss_feeds():
     state = load_state()
     new_alerts = 0
 
     for feed_url in RSS_FEEDS:
-        print("Prüfe Feed:", feed_url)
+        print("Prüfe RSS:", feed_url)
         try:
             feed = feedparser.parse(feed_url)
         except Exception as e:
-            print("Feed Fehler:", e)
+            print("RSS Fehler:", e)
             continue
 
         for entry in feed.entries[:30]:
             try:
-                if process_entry(state, entry):
+                if process_rss_entry(state, entry):
                     new_alerts += 1
             except Exception as e:
-                print("Fehler bei Entry:", e)
+                print("Fehler bei RSS Entry:", e)
+
+    state["_tmp_new_alerts"] = new_alerts
+    return state
+
+
+def check_direct_sources(state):
+    count = 0
+    count += process_usgs_feed(state, USGS_SIGNIFICANT_EARTHQUAKES_URL)
+    count += process_usgs_feed(state, USGS_ALL_M45_EARTHQUAKES_URL)
+    return count
+
+
+def run_cycle():
+    print("Version 7 Direct Sources Check läuft...")
+
+    state = check_rss_feeds()
+    direct_alerts = check_direct_sources(state)
 
     maybe_send_medium_digest(state)
     maybe_send_daily_summary(state)
     save_state(state)
-    print("Neue Alerts:", new_alerts)
 
-
-def run_cycle():
-    print("Version 6 Fast Live Check läuft...")
-    check_feeds()
+    total = state.get("_tmp_new_alerts", 0) + direct_alerts
+    print("Neue Alerts gesamt:", total)
     time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    send_telegram("✅ Krisen-Agent V6 Fast Live Monitoring gestartet")
+    send_telegram("✅ Krisen-Agent V7 Direct Sources gestartet")
     while True:
         try:
             run_cycle()
