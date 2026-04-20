@@ -11,6 +11,9 @@ from html import unescape
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Optional für später:
+ICAO_API_KEY = os.getenv("ICAO_API_KEY")
+
 CHECK_INTERVAL = 30
 HTTP_TIMEOUT = 20
 STATE_FILE = "agent_state.json"
@@ -22,14 +25,16 @@ RSS_FEEDS = [
 
 USGS_SIGNIFICANT_EARTHQUAKES_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_hour.geojson"
 USGS_ALL_M45_EARTHQUAKES_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_hour.geojson"
-
-# Offizielle Direktquellen
 EIA_DAILY_PRICES_URL = "https://www.eia.gov/todayinenergy/prices.php"
-STATE_TRAVEL_ADVISORIES_URL = "https://cadataapi.state.gov/api/TravelAdvisories"
+
+# Offizielle State Department Seiten
+STATE_TRAVEL_ADVISORIES_PAGE = "https://travel.state.gov/en/international-travel/travel-advisories.html"
+STATE_MIDDLE_EAST_PAGE = "https://travel.state.gov/en/international-travel/travel-advisories/global-events/middle-east.html"
 
 WATCH_REGIONS = [
-    "iran", "israel", "gaza", "lebanon", "syria", "iraq",
-    "yemen", "saudi", "qatar", "uae", "emirates", "oman",
+    "iran", "israel", "gaza", "west bank", "lebanon", "syria", "iraq",
+    "yemen", "saudi", "qatar", "uae", "emirates", "oman", "jordan",
+    "bahrain", "kuwait", "egypt",
     "hormuz", "strait of hormuz", "red sea",
     "russia", "ukraine", "taiwan", "china",
     "usa", "united states", "nato", "europe", "germany",
@@ -50,7 +55,7 @@ CATEGORIES = {
     "FLUGSPERRE": [
         "closed airspace", "airspace closed", "flight ban", "flights suspended",
         "airport closed", "aviation warning", "travel disruption",
-        "air traffic suspended", "airspace restriction"
+        "air traffic suspended", "airspace restriction", "notam"
     ],
     "EVAKUIERUNG": [
         "evacuation", "evacuate", "embassy evacuation", "citizens warned",
@@ -63,7 +68,7 @@ CATEGORIES = {
     "REISEWARNUNG": [
         "travel warning", "travel advisory", "do not travel",
         "avoid all travel", "security alert", "tourist warning",
-        "reconsider travel"
+        "reconsider travel", "exercise increased caution"
     ],
     "ERDBEBEN": [
         "earthquake", "quake", "seismic", "aftershock"
@@ -88,7 +93,6 @@ MEDIUM_DIGEST_MIN_ITEMS = 3
 HIGH_ALERT_COOLDOWN_MINUTES = 20
 MEDIUM_DIGEST_COOLDOWN_MINUTES = 30
 
-# Öl-Logik
 BRENT_HIGH_PRICE = 100.0
 WTI_HIGH_PRICE = 90.0
 PRICE_SPIKE_PERCENT = 3.0
@@ -116,7 +120,7 @@ def send_telegram(msg: str):
 
     try:
         r = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
-        print("Telegram status:", r.status_code, r.text[:300])
+        print("Telegram status:", r.status_code, r.text[:200])
         return r.status_code == 200
     except Exception as e:
         print("Telegram Fehler:", e)
@@ -179,6 +183,11 @@ def text_blob(title: str, summary: str) -> str:
     return f"{title} {summary}".lower()
 
 
+def strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    return " ".join(unescape(text).split())
+
+
 def is_blacklisted(title: str, summary: str) -> bool:
     text = text_blob(title, summary)
     return any(word in text for word in BLACKLIST_WORDS)
@@ -230,17 +239,13 @@ def should_alert(category: str, risk: str, title: str, summary: str) -> bool:
             "brent", "wti", "oil", "crude", "hormuz", "supply disruption", "shipping disruption"
         ])
 
-    if category == "ERDBEBEN":
+    if category in ["ERDBEBEN", "REISEWARNUNG", "FLUGSPERRE"]:
         return True
 
-    if not is_relevant_region(title, summary) and category != "REISEWARNUNG":
+    if not is_relevant_region(title, summary):
         return False
 
     return risk in ["HIGH", "MEDIUM"]
-
-
-def is_duplicate_title(normalized_title: str, recent_titles: list) -> bool:
-    return normalized_title in recent_titles
 
 
 def remember_title(state, normalized_title: str, max_titles: int = 500):
@@ -318,7 +323,6 @@ def queue_medium_alert(state, category: str, title: str, link: str, source: str)
         "source": source
     }
     state["medium_digest_queue"].append(item)
-
     if len(state["medium_digest_queue"]) > 100:
         state["medium_digest_queue"] = state["medium_digest_queue"][-100:]
 
@@ -350,12 +354,10 @@ def maybe_send_daily_summary(state):
 
     if now.hour < SUMMARY_HOUR_UTC:
         return
-
     if state["last_summary_date"] == today:
         return
 
     total = sum(state["daily_counts"].values())
-
     if total == 0:
         summary = "📊 TAGESZUSAMMENFASSUNG\n\nHeute wurden keine relevanten Krisen-Alerts erkannt."
     else:
@@ -371,7 +373,7 @@ def maybe_send_daily_summary(state):
 
 def process_rss_entry(state, entry):
     title = getattr(entry, "title", "").strip()
-    summary = getattr(entry, "summary", "").strip()
+    summary = strip_html(getattr(entry, "summary", "").strip())
     link = getattr(entry, "link", "").strip()
     source = getattr(entry, "source", {}).get("title", "Unbekannt") if hasattr(entry, "source") else "Unbekannt"
 
@@ -383,8 +385,7 @@ def process_rss_entry(state, entry):
 
     if alert_id in state["seen_ids"]:
         return False
-
-    if is_duplicate_title(normalized_title, state["recent_titles"]):
+    if normalized_title in state["recent_titles"]:
         return False
 
     category = detect_category(title, summary)
@@ -400,11 +401,8 @@ def process_rss_entry(state, entry):
     if risk == "HIGH":
         cooldown_key = f"{category}:{normalized_title[:120]}"
         if high_alert_on_cooldown(state, cooldown_key):
-            print("HIGH auf Cooldown:", cooldown_key)
             return False
-
-        msg = format_message(category, risk, title, link, source)
-        if send_telegram(msg):
+        if send_telegram(format_message(category, risk, title, link, source)):
             mark_high_alert_sent(state, cooldown_key)
     else:
         queue_medium_alert(state, category, title, link, source)
@@ -441,25 +439,19 @@ def process_usgs_feed(state, url):
         increment_daily_count(state, "ERDBEBEN")
 
         risk = "HIGH" if float(mag) >= 6.0 else "MEDIUM"
-        source = "USGS"
-
         if risk == "HIGH":
             cooldown_key = f"ERDBEBEN:{quake_id}"
             if not high_alert_on_cooldown(state, cooldown_key):
-                msg = format_earthquake_message(float(mag), place, link, source, ts_ms)
-                if send_telegram(msg):
+                if send_telegram(format_earthquake_message(float(mag), place, link, "USGS", ts_ms)):
                     mark_high_alert_sent(state, cooldown_key)
         else:
-            title = f"M {mag} earthquake - {place}"
-            queue_medium_alert(state, "ERDBEBEN", title, link, source)
-
+            queue_medium_alert(state, "ERDBEBEN", f"M {mag} earthquake - {place}", link, "USGS")
         alerts += 1
 
     return alerts
 
 
 def extract_price_and_change(html: str, label: str):
-    # Beispiel-Zeile: Brent 116.63 +1.5
     pattern = rf"{label}\s+([0-9]+(?:\.[0-9]+)?)\s+([+-]?[0-9]+(?:\.[0-9]+)?)"
     match = re.search(pattern, html, re.IGNORECASE)
     if not match:
@@ -480,35 +472,30 @@ def check_eia_oil_prices(state):
     wti_price, wti_change = extract_price_and_change(html, "WTI")
 
     if brent_price is None and wti_price is None:
-        print("Keine Ölpreise gefunden.")
         return 0
 
     alerts = 0
-    last = state.get("oil_last", {})
-
-    messages = []
-
     if brent_price is not None:
         is_high = brent_price >= BRENT_HIGH_PRICE or (brent_change is not None and brent_change >= PRICE_SPIKE_PERCENT)
         if is_high:
-            messages.append(
-                f"🔴 ÖL-ALERT [HIGH]\n\nBrent: ${brent_price:.2f}/bbl\nÄnderung: {brent_change:+.1f}%\n\nQuelle: EIA\n{EIA_DAILY_PRICES_URL}"
-            )
+            msg = f"🔴 ÖL-ALERT [HIGH]\n\nBrent: ${brent_price:.2f}/bbl\nÄnderung: {brent_change:+.1f}%\n\nQuelle: EIA\n{EIA_DAILY_PRICES_URL}"
+            key = f"OIL:BRENT:{int(brent_price)}:{int(brent_change or 0)}"
+            if not high_alert_on_cooldown(state, key):
+                if send_telegram(msg):
+                    mark_high_alert_sent(state, key)
+                    increment_daily_count(state, "ÖL")
+                    alerts += 1
 
     if wti_price is not None:
         is_high = wti_price >= WTI_HIGH_PRICE or (wti_change is not None and wti_change >= PRICE_SPIKE_PERCENT)
         if is_high:
-            messages.append(
-                f"🔴 ÖL-ALERT [HIGH]\n\nWTI: ${wti_price:.2f}/bbl\nÄnderung: {wti_change:+.1f}%\n\nQuelle: EIA\n{EIA_DAILY_PRICES_URL}"
-            )
-
-    for msg in messages:
-        cooldown_key = make_id(msg[:120])
-        if not high_alert_on_cooldown(state, cooldown_key):
-            if send_telegram(msg):
-                mark_high_alert_sent(state, cooldown_key)
-                increment_daily_count(state, "ÖL")
-                alerts += 1
+            msg = f"🔴 ÖL-ALERT [HIGH]\n\nWTI: ${wti_price:.2f}/bbl\nÄnderung: {wti_change:+.1f}%\n\nQuelle: EIA\n{EIA_DAILY_PRICES_URL}"
+            key = f"OIL:WTI:{int(wti_price)}:{int(wti_change or 0)}"
+            if not high_alert_on_cooldown(state, key):
+                if send_telegram(msg):
+                    mark_high_alert_sent(state, key)
+                    increment_daily_count(state, "ÖL")
+                    alerts += 1
 
     state["oil_last"] = {
         "brent_price": brent_price,
@@ -517,90 +504,100 @@ def check_eia_oil_prices(state):
         "wti_change_pct": wti_change,
         "last_check": now_iso()
     }
-
     return alerts
 
 
-def travel_level_to_risk(level_text: str):
-    text = (level_text or "").lower()
-
-    if "level 4" in text or "do not travel" in text:
-        return "HIGH", "REISEWARNUNG"
-    if "level 3" in text or "reconsider travel" in text:
-        return "MEDIUM", "REISEWARNUNG"
-    return None, None
-
-
-def check_state_travel_advisories(state):
+def check_state_middle_east_page(state):
     try:
-        r = requests.get(STATE_TRAVEL_ADVISORIES_URL, timeout=HTTP_TIMEOUT)
+        r = requests.get(STATE_MIDDLE_EAST_PAGE, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        data = r.json()
+        html = unescape(r.text)
     except Exception as e:
-        print("State Travel API Fehler:", e)
+        print("State Middle East Fehler:", e)
         return 0
 
     alerts = 0
 
-    items = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
-    for item in items:
-        country = (
-            item.get("country")
-            or item.get("CountryName")
-            or item.get("name")
-            or item.get("title")
-            or "Unbekannt"
-        )
-        level = (
-            item.get("advisoryLevel")
-            or item.get("TravelAdvisory")
-            or item.get("level")
-            or item.get("Level")
-            or ""
-        )
-        link = (
-            item.get("url")
-            or item.get("Url")
-            or item.get("link")
-            or "https://travel.state.gov/content/travel/en/traveladvisories/traveladvisories.html"
-        )
-        updated = item.get("lastUpdated") or item.get("LastUpdateDate") or ""
+    patterns = [
+        ("WORLDWIDE CAUTION", r"exercise increased caution"),
+        ("MIDDLE EAST SECURITY", r"latest security updates"),
+        ("IRAN", r"### Iran"),
+        ("IRAQ", r"### Iraq"),
+        ("ISRAEL/WEST BANK/GAZA", r"### Israel, West Bank, and Gaza"),
+        ("YEMEN", r"### Yemen"),
+    ]
 
-        risk, category = travel_level_to_risk(str(level))
-        if not risk:
-            continue
-
-        title = f"{country} Travel Advisory - {level}".strip()
-        alert_id = make_id(f"state-travel:{country}:{level}:{updated}")
-
-        if alert_id in state["seen_ids"]:
-            continue
-
-        remember_seen_id(state, alert_id)
-        increment_daily_count(state, category)
-
-        source = "U.S. Department of State"
-        if risk == "HIGH":
-            cooldown_key = f"TRAVEL:{country}:{level}"
-            if high_alert_on_cooldown(state, cooldown_key):
+    for label, patt in patterns:
+        if re.search(patt, html, re.IGNORECASE):
+            alert_id = make_id(f"state-middle-east:{label}:2026")
+            if alert_id in state["seen_ids"]:
                 continue
 
-            msg = format_message(category, risk, title, link, source)
-            if send_telegram(msg):
-                mark_high_alert_sent(state, cooldown_key)
-                alerts += 1
-        else:
-            queue_medium_alert(state, category, title, link, source)
+            remember_seen_id(state, alert_id)
+            increment_daily_count(state, "REISEWARNUNG")
+
+            title = f"{label} security/travel update on official State Department Middle East page"
+            queue_medium_alert(state, "REISEWARNUNG", title, STATE_MIDDLE_EAST_PAGE, "U.S. Department of State")
             alerts += 1
 
     return alerts
 
 
-def check_rss_feeds(state):
-    new_alerts = 0
+def check_state_specific_advisories_from_page(state):
+    try:
+        r = requests.get(STATE_TRAVEL_ADVISORIES_PAGE, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        html = unescape(r.text)
+    except Exception as e:
+        print("State Advisories Fehler:", e)
+        return 0
 
+    alerts = 0
+
+    triggers = [
+        ("WORLDWIDE CAUTION", "exercise increased caution", "MEDIUM"),
+        ("DO NOT TRAVEL", "Do not travel", "HIGH"),
+        ("RECONSIDER TRAVEL", "Reconsider your travel", "MEDIUM"),
+    ]
+
+    for label, needle, risk in triggers:
+        if needle.lower() not in html.lower():
+            continue
+
+        alert_id = make_id(f"travel-page:{label}")
+        if alert_id in state["seen_ids"]:
+            continue
+
+        remember_seen_id(state, alert_id)
+        increment_daily_count(state, "REISEWARNUNG")
+
+        title = f"Official travel advisory page contains: {label}"
+        if risk == "HIGH":
+            key = f"STATE_TRAVEL:{label}"
+            if not high_alert_on_cooldown(state, key):
+                if send_telegram(format_message("REISEWARNUNG", "HIGH", title, STATE_TRAVEL_ADVISORIES_PAGE, "U.S. Department of State")):
+                    mark_high_alert_sent(state, key)
+                    alerts += 1
+        else:
+            queue_medium_alert(state, "REISEWARNUNG", title, STATE_TRAVEL_ADVISORIES_PAGE, "U.S. Department of State")
+            alerts += 1
+
+    return alerts
+
+
+def check_aviation_placeholder(state):
+    # Solange kein ICAO_API_KEY gesetzt ist, nur Hinweis im Log.
+    if not ICAO_API_KEY:
+        print("Aviation API Key fehlt - ICAO/FAA Direktmodul noch nicht aktiv.")
+        return 0
+
+    # Platz für später: echter ICAO API Call mit Key
+    return 0
+
+
+def check_rss_feeds(state):
+    count = 0
     for feed_url in RSS_FEEDS:
-        print("Prüfe RSS:", feed_url)
         try:
             feed = feedparser.parse(feed_url)
         except Exception as e:
@@ -610,11 +607,10 @@ def check_rss_feeds(state):
         for entry in feed.entries[:30]:
             try:
                 if process_rss_entry(state, entry):
-                    new_alerts += 1
+                    count += 1
             except Exception as e:
                 print("Fehler bei RSS Entry:", e)
-
-    return new_alerts
+    return count
 
 
 def check_direct_sources(state):
@@ -622,13 +618,14 @@ def check_direct_sources(state):
     count += process_usgs_feed(state, USGS_SIGNIFICANT_EARTHQUAKES_URL)
     count += process_usgs_feed(state, USGS_ALL_M45_EARTHQUAKES_URL)
     count += check_eia_oil_prices(state)
-    count += check_state_travel_advisories(state)
+    count += check_state_middle_east_page(state)
+    count += check_state_specific_advisories_from_page(state)
+    count += check_aviation_placeholder(state)
     return count
 
 
 def run_cycle():
-    print("Version 8 Hybrid Direct Monitoring läuft...")
-
+    print("Version 9 Official Hybrid Monitoring läuft...")
     state = load_state()
 
     rss_alerts = check_rss_feeds(state)
@@ -638,13 +635,12 @@ def run_cycle():
     maybe_send_daily_summary(state)
     save_state(state)
 
-    total = rss_alerts + direct_alerts
-    print("Neue Alerts gesamt:", total)
+    print("Neue Alerts gesamt:", rss_alerts + direct_alerts)
     time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    send_telegram("✅ Krisen-Agent V8 Hybrid Direct Monitoring gestartet")
+    send_telegram("✅ Krisen-Agent V9 Official Hybrid Monitoring gestartet")
     while True:
         try:
             run_cycle()
