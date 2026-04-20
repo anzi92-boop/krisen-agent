@@ -9,7 +9,8 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 30
+HTTP_TIMEOUT = 20
 STATE_FILE = "agent_state.json"
 
 RSS_FEEDS = [
@@ -72,17 +73,37 @@ BLACKLIST_WORDS = [
 
 SUMMARY_HOUR_UTC = 18
 MEDIUM_DIGEST_MIN_ITEMS = 3
+HIGH_ALERT_COOLDOWN_MINUTES = 20
+MEDIUM_DIGEST_COOLDOWN_MINUTES = 30
+
+
+def utc_now():
+    return datetime.utcnow()
+
+
+def now_iso():
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def send_telegram(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
         print("TELEGRAM Variablen fehlen.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg}
-    r = requests.post(url, data=data, timeout=20)
-    print("Telegram status:", r.status_code, r.text)
+    data = {
+        "chat_id": CHAT_ID,
+        "text": msg,
+        "disable_web_page_preview": True
+    }
+
+    try:
+        r = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
+        print("Telegram status:", r.status_code, r.text[:300])
+        return r.status_code == 200
+    except Exception as e:
+        print("Telegram Fehler:", e)
+        return False
 
 
 def load_state():
@@ -92,7 +113,8 @@ def load_state():
         "daily_counts": {},
         "last_summary_date": "",
         "medium_digest_queue": [],
-        "last_medium_digest_sent": ""
+        "last_medium_digest_sent_at": "",
+        "high_alert_history": {}
     }
 
     if not os.path.exists(STATE_FILE):
@@ -184,7 +206,7 @@ def should_alert(category: str, risk: str, title: str, summary: str) -> bool:
             "brent", "wti", "oil", "crude", "hormuz", "supply disruption", "shipping disruption"
         ])
 
-    if not is_relevant_region(title, summary) and category not in ["ÖL"]:
+    if not is_relevant_region(title, summary) and category != "ÖL":
         return False
 
     return risk in ["HIGH", "MEDIUM"]
@@ -194,13 +216,13 @@ def is_duplicate_title(normalized_title: str, recent_titles: list) -> bool:
     return normalized_title in recent_titles
 
 
-def remember_title(state, normalized_title: str, max_titles: int = 300):
+def remember_title(state, normalized_title: str, max_titles: int = 400):
     state["recent_titles"].append(normalized_title)
     if len(state["recent_titles"]) > max_titles:
         state["recent_titles"] = state["recent_titles"][-max_titles:]
 
 
-def remember_seen_id(state, alert_id: str, max_ids: int = 1500):
+def remember_seen_id(state, alert_id: str, max_ids: int = 2000):
     state["seen_ids"].append(alert_id)
     if len(state["seen_ids"]) > max_ids:
         state["seen_ids"] = state["seen_ids"][-max_ids:]
@@ -222,6 +244,32 @@ def format_message(category: str, risk: str, title: str, link: str, source: str)
     )
 
 
+def minutes_since(iso_string: str):
+    if not iso_string:
+        return None
+    try:
+        past = datetime.strptime(iso_string, "%Y-%m-%dT%H:%M:%SZ")
+        diff = utc_now() - past
+        return diff.total_seconds() / 60
+    except Exception:
+        return None
+
+
+def high_alert_on_cooldown(state, cooldown_key: str) -> bool:
+    history = state.get("high_alert_history", {})
+    last_sent = history.get(cooldown_key, "")
+    mins = minutes_since(last_sent)
+    return mins is not None and mins < HIGH_ALERT_COOLDOWN_MINUTES
+
+
+def mark_high_alert_sent(state, cooldown_key: str):
+    state["high_alert_history"][cooldown_key] = now_iso()
+
+    if len(state["high_alert_history"]) > 1000:
+        items = list(state["high_alert_history"].items())[-1000:]
+        state["high_alert_history"] = dict(items)
+
+
 def queue_medium_alert(state, category: str, title: str, link: str, source: str):
     item = {
         "category": category,
@@ -231,18 +279,17 @@ def queue_medium_alert(state, category: str, title: str, link: str, source: str)
     }
     state["medium_digest_queue"].append(item)
 
-    if len(state["medium_digest_queue"]) > 50:
-        state["medium_digest_queue"] = state["medium_digest_queue"][-50:]
+    if len(state["medium_digest_queue"]) > 80:
+        state["medium_digest_queue"] = state["medium_digest_queue"][-80:]
 
 
 def maybe_send_medium_digest(state):
-    today_hour = datetime.utcnow().strftime("%Y-%m-%d-%H")
     queue = state["medium_digest_queue"]
-
     if len(queue) < MEDIUM_DIGEST_MIN_ITEMS:
         return
 
-    if state["last_medium_digest_sent"] == today_hour:
+    mins = minutes_since(state.get("last_medium_digest_sent_at", ""))
+    if mins is not None and mins < MEDIUM_DIGEST_COOLDOWN_MINUTES:
         return
 
     lines = ["🟠 MEDIUM-SAMMELALERT", ""]
@@ -252,13 +299,13 @@ def maybe_send_medium_digest(state):
         lines.append(f"  {item['link']}")
         lines.append("")
 
-    send_telegram("\n".join(lines).strip())
-    state["medium_digest_queue"] = []
-    state["last_medium_digest_sent"] = today_hour
+    if send_telegram("\n".join(lines).strip()):
+        state["medium_digest_queue"] = []
+        state["last_medium_digest_sent_at"] = now_iso()
 
 
 def maybe_send_daily_summary(state):
-    now = datetime.utcnow()
+    now = utc_now()
     today = now.strftime("%Y-%m-%d")
 
     if now.hour < SUMMARY_HOUR_UTC:
@@ -272,14 +319,14 @@ def maybe_send_daily_summary(state):
     if total == 0:
         summary = "📊 TAGESZUSAMMENFASSUNG\n\nHeute wurden keine relevanten Krisen-Alerts erkannt."
     else:
-        lines = [f"📊 TAGESZUSAMMENFASSUNG", "", f"Gesamt: {total} Alerts", ""]
+        lines = ["📊 TAGESZUSAMMENFASSUNG", "", f"Gesamt: {total} Alerts", ""]
         for category, count in sorted(state["daily_counts"].items(), key=lambda x: x[0]):
             lines.append(f"- {category}: {count}")
         summary = "\n".join(lines)
 
-    send_telegram(summary)
-    state["last_summary_date"] = today
-    state["daily_counts"] = {}
+    if send_telegram(summary):
+        state["last_summary_date"] = today
+        state["daily_counts"] = {}
 
 
 def process_entry(state, entry):
@@ -294,7 +341,7 @@ def process_entry(state, entry):
     normalized_title = normalize_title(title)
     alert_id = make_id(title + link)
 
-    if alert_id in set(state["seen_ids"]):
+    if alert_id in state["seen_ids"]:
         return False
 
     if is_duplicate_title(normalized_title, state["recent_titles"]):
@@ -311,8 +358,14 @@ def process_entry(state, entry):
     increment_daily_count(state, category)
 
     if risk == "HIGH":
+        cooldown_key = f"{category}:{normalized_title[:120]}"
+        if high_alert_on_cooldown(state, cooldown_key):
+            print("HIGH auf Cooldown:", cooldown_key)
+            return False
+
         msg = format_message(category, risk, title, link, source)
-        send_telegram(msg)
+        if send_telegram(msg):
+            mark_high_alert_sent(state, cooldown_key)
     else:
         queue_medium_alert(state, category, title, link, source)
 
@@ -325,9 +378,13 @@ def check_feeds():
 
     for feed_url in RSS_FEEDS:
         print("Prüfe Feed:", feed_url)
-        feed = feedparser.parse(feed_url)
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print("Feed Fehler:", e)
+            continue
 
-        for entry in feed.entries[:25]:
+        for entry in feed.entries[:30]:
             try:
                 if process_entry(state, entry):
                     new_alerts += 1
@@ -341,16 +398,16 @@ def check_feeds():
 
 
 def run_cycle():
-    print("Version 5 Check läuft...")
+    print("Version 6 Fast Live Check läuft...")
     check_feeds()
     time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    send_telegram("✅ Krisen-Agent V5 gestartet")
+    send_telegram("✅ Krisen-Agent V6 Fast Live Monitoring gestartet")
     while True:
         try:
             run_cycle()
         except Exception as e:
             print("Fehler im Hauptloop:", e)
-            time.sleep(30)
+            time.sleep(10)
